@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, createContext, useContext } from 'react';
+import React, { useState, useEffect, createContext, useContext } from 'react';
 import { BrowserRouter as Router, Routes, Route as RouterRoute, Link, useNavigate } from 'react-router-dom';
 import { MapContainer, TileLayer, Polyline, CircleMarker, Marker, Popup, useMapEvent } from 'react-leaflet';
 import L from 'leaflet';
@@ -6,7 +6,7 @@ import 'leaflet/dist/leaflet.css';
 import {
   MapPin, Warehouse, Flag, Navigation, Play, RotateCcw, 
   Info, Zap, Clock, GitGraph, BarChart3, Sun, Moon, 
-  Truck, Route as RouteIcon, AlertTriangle, ChevronRight, Layers, Road
+  Route as RouteIcon, AlertTriangle, ChevronRight, Layers, Road
 } from 'lucide-react';
 
 /* ============================================================
