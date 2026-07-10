@@ -1,4 +1,4 @@
-import React, { useState, useEffect, createContext, useContext } from 'react';
+import React, { useState, useEffect, useRef, createContext, useContext } from 'react';
 import { BrowserRouter as Router, Routes, Route as RouterRoute, Link, useNavigate } from 'react-router-dom';
 import { MapContainer, TileLayer, Polyline, CircleMarker, Marker, Popup, useMapEvent } from 'react-leaflet';
 import L from 'leaflet';
@@ -6,8 +6,59 @@ import 'leaflet/dist/leaflet.css';
 import {
   MapPin, Warehouse, Flag, Navigation, Play, RotateCcw, 
   Info, Zap, Clock, GitGraph, BarChart3, Sun, Moon, 
-  Route as RouteIcon, AlertTriangle, ChevronRight, Layers, Road
+  AlertTriangle, ChevronRight, Layers, Road, Compass, Waypoints
 } from 'lucide-react';
+
+/* ============================================================
+   GLOBAL DESIGN TOKENS
+   The palette is pulled straight from the app's own map legend
+   (amber = Dijkstra's frontier, violet = A*'s frontier, cyan =
+   the optimal path) rather than an invented brand palette — the
+   chrome speaks the same visual language as the visualizer itself.
+   ============================================================ */
+const GlobalStyle = () => {
+  useEffect(() => {
+    if (document.getElementById('aeroroute-font-link')) return;
+    const link = document.createElement('link');
+    link.id = 'aeroroute-font-link';
+    link.rel = 'stylesheet';
+    link.href = 'https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap';
+    document.head.appendChild(link);
+  }, []);
+  return (
+    <style>{`
+      :root {
+        --ink: #060a14;
+        --panel: #0f1729;
+        --cyan: #22d3ee;
+        --cyan-deep: #06b6d4;
+        --amber: #fbbf24;
+        --violet: #a78bfa;
+        --route-line: linear-gradient(90deg, var(--amber), var(--cyan), var(--violet));
+      }
+      .font-display { font-family: 'Space Grotesk', 'Inter', sans-serif; letter-spacing: -0.01em; }
+      .font-body { font-family: 'Inter', sans-serif; }
+      .font-data { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+      @keyframes pulse-ring {
+        0% { r: 3; opacity: 0.9; }
+        70% { opacity: 0; }
+        100% { r: 26; opacity: 0; }
+      }
+      @keyframes node-glow {
+        0%, 100% { opacity: 0.55; }
+        50% { opacity: 1; }
+      }
+      @keyframes dash-travel {
+        to { stroke-dashoffset: -200; }
+      }
+      @keyframes fade-up {
+        from { opacity: 0; transform: translateY(10px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+      .fade-up { animation: fade-up 0.6s ease-out both; }
+    `}</style>
+  );
+};
 
 /* ============================================================
    GLOBAL THEME CONTEXT
@@ -31,10 +82,64 @@ const ThemeProvider = ({ children }) => {
 const useTheme = () => useContext(ThemeContext);
 
 /* ============================================================
+   SIGNATURE ELEMENT — GraphPulse
+   A small abstract node graph where an amber ring expands
+   uniformly outward from the source (Dijkstra's wavefront) while
+   a violet pulse cuts a direct dashed line to the target (A*'s
+   heuristic-guided beeline). This is the visual thesis of the
+   whole app, reused at different scales across the marketing
+   pages instead of a generic hero graphic.
+   ============================================================ */
+const GRAPH_PULSE_NODES = [
+  { id: 'n0', x: 40, y: 160, ring: 0 }, { id: 'n1', x: 120, y: 80, ring: 1 },
+  { id: 'n2', x: 120, y: 160, ring: 1 }, { id: 'n3', x: 120, y: 240, ring: 1 },
+  { id: 'n4', x: 210, y: 40, ring: 2 }, { id: 'n5', x: 210, y: 120, ring: 2 },
+  { id: 'n6', x: 210, y: 200, ring: 2 }, { id: 'n7', x: 210, y: 280, ring: 2 },
+  { id: 'n8', x: 310, y: 80, ring: 3 }, { id: 'n9', x: 310, y: 160, ring: 3 },
+  { id: 'n10', x: 310, y: 240, ring: 3 }, { id: 'n11', x: 400, y: 160, ring: 4 },
+];
+const GRAPH_PULSE_EDGES = [
+  ['n0', 'n1'], ['n0', 'n2'], ['n0', 'n3'], ['n1', 'n4'], ['n1', 'n5'], ['n2', 'n5'],
+  ['n2', 'n6'], ['n3', 'n6'], ['n3', 'n7'], ['n4', 'n8'], ['n5', 'n8'], ['n5', 'n9'],
+  ['n6', 'n9'], ['n6', 'n10'], ['n7', 'n10'], ['n8', 'n11'], ['n9', 'n11'], ['n10', 'n11'],
+];
+const GRAPH_PULSE_DIRECT_PATH = ['n0', 'n2', 'n5', 'n9', 'n11']; // A*'s beeline to target
+
+const GraphPulse = ({ className = '', height = 320 }) => {
+  const byId = Object.fromEntries(GRAPH_PULSE_NODES.map(n => [n.id, n]));
+  const directSet = new Set(GRAPH_PULSE_DIRECT_PATH);
+  return (
+    <svg viewBox="0 0 440 320" className={className} height={height} role="img" aria-label="Animated graph showing Dijkstra's uniform wavefront versus A*'s direct search">
+      {GRAPH_PULSE_EDGES.map(([a, b]) => {
+        const na = byId[a], nb = byId[b];
+        return <line key={`${a}-${b}`} x1={na.x} y1={na.y} x2={nb.x} y2={nb.y} stroke="#334155" strokeWidth="1.5" opacity="0.5" />;
+      })}
+      {GRAPH_PULSE_DIRECT_PATH.slice(0, -1).map((id, i) => {
+        const a = byId[id], b = byId[GRAPH_PULSE_DIRECT_PATH[i + 1]];
+        return (
+          <line key={`direct-${id}`} x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+            stroke="var(--violet)" strokeWidth="2.5" strokeDasharray="6 8" opacity="0.85"
+            style={{ animation: 'dash-travel 3.2s linear infinite' }} />
+        );
+      })}
+      {GRAPH_PULSE_NODES.map(n => (
+        <circle key={`ring-${n.id}`} cx={n.x} cy={n.y} r="3" fill="none" stroke="var(--amber)" strokeWidth="1.5"
+          style={{ animation: `pulse-ring 3.2s ease-out infinite`, animationDelay: `${n.ring * 0.32}s` }} />
+      ))}
+      {GRAPH_PULSE_NODES.map(n => (
+        <circle key={n.id} cx={n.x} cy={n.y} r={n.id === 'n0' || n.id === 'n11' ? 6 : 4}
+          fill={n.id === 'n0' ? 'var(--amber)' : n.id === 'n11' ? 'var(--cyan)' : directSet.has(n.id) ? 'var(--violet)' : '#475569'}
+          style={{ animation: 'node-glow 3.2s ease-in-out infinite', animationDelay: `${n.ring * 0.15}s` }} />
+      ))}
+    </svg>
+  );
+};
+
+/* ============================================================
    BANGALORE ARTERIAL ROAD NETWORK — REAL-WORLD ALIGNED
    36 nodes at actual major intersections, edges with real OSM geometries
    ============================================================ */
-const BANGALORE_GRAPH = {
+const ARTERIAL_GRAPH_RAW = {
   nodes: {
     /* === CBD CORE === */
     majestic:        { id:'majestic',        name:'Majestic',               lat:12.9763, lng:77.5929 },
@@ -370,6 +475,256 @@ const BANGALORE_GRAPH = {
 };
 
 /* ============================================================
+   PHASE 1 — ROAD NETWORK EXPANSION
+   Two build steps turn the 44-node arterial skeleton above into a much
+   denser, more realistic routing graph:
+
+   1. generateSecondaryNetwork()  — procedurally adds secondary/tertiary
+      roads (residential loops + connector spurs) around known sparse
+      zones, anchored back onto the arterial graph. In a production
+      deployment this generator would be swapped for a real OpenStreetMap
+      import (via the Overpass API) — see the OVERPASS IMPORT note below.
+   2. enrichGraphWithIntersections() — the "turn at any intersection"
+      enrichment. It detects every place two road polylines actually cross
+      (including brand-new secondary roads crossing arterial ones) and
+      splits both edges there, so the router can change roads at that
+      point instead of having to travel all the way to a named junction.
+   ============================================================ */
+
+function pathLengthKm(path) {
+  let d = 0;
+  for (let i = 0; i < path.length - 1; i++) d += haversine(path[i][0], path[i][1], path[i + 1][0], path[i + 1][1]);
+  return d;
+}
+
+// Procedural secondary/tertiary road generator.
+// Fills in residential & industrial pockets around named arterial hubs with
+// a small loop of connector roads, roughly matching the "50-100 additional
+// roads, prioritising currently sparse areas" requirement.
+function generateSecondaryNetwork(baseNodes) {
+  const clusters = [
+    { anchor: 'jayanagar', count: 3 }, { anchor: 'jp_nagar', count: 3 },
+    { anchor: 'banashankari', count: 3 }, { anchor: 'koramangala', count: 4 },
+    { anchor: 'btm_jn', count: 3 }, { anchor: 'hsr_jn', count: 3 },
+    { anchor: 'indiranagar_100', count: 3 }, { anchor: 'domlur_jn', count: 3 },
+    { anchor: 'malleshwaram_18', count: 3 }, { anchor: 'rajajinagar_6', count: 3 },
+    { anchor: 'sanjay_nagar', count: 3 }, { anchor: 'vijayanagar', count: 3 },
+    { anchor: 'marathahalli', count: 3 }, { anchor: 'whitefield', count: 3 },
+    { anchor: 'ejipura', count: 3 }, { anchor: 'bommanahalli', count: 3 },
+    { anchor: 'frazer_town', count: 3 }, { anchor: 'seshadripuram', count: 3 },
+    { anchor: 'hebbal_flyover', count: 3 },
+  ];
+  const nodes = {}; const edges = []; let edgeCounter = 1;
+  // deterministic offset ring around each anchor (~350-600m spacing)
+  const ring = [
+    [0.0045, 0.0000], [0.0032, 0.0032], [0.0000, 0.0045],
+    [-0.0032, 0.0032], [-0.0045, 0.0000], [-0.0032, -0.0032],
+    [0.0000, -0.0045], [0.0032, -0.0032],
+  ];
+  const suffixes = ['Main Road', 'Cross', '1st Cross', '2nd Main', 'Service Road', 'Ring Road'];
+
+  clusters.forEach((cluster) => {
+    const anchor = baseNodes[cluster.anchor];
+    if (!anchor) return;
+    const localIds = [];
+    for (let i = 0; i < cluster.count; i++) {
+      const [dLat, dLng] = ring[i % ring.length];
+      const id = `sec_${cluster.anchor}_${i}`;
+      const lat = anchor.lat + dLat, lng = anchor.lng + dLng;
+      nodes[id] = { id, name: `${anchor.name} ${suffixes[i % suffixes.length]} Jn ${i + 1}`, lat, lng, tier: 'secondary' };
+      localIds.push(id);
+    }
+    // spur road connecting each secondary node back to the anchor
+    localIds.forEach((nid, i) => {
+      const n = nodes[nid];
+      const mid = [(anchor.lat + n.lat) / 2 + (i % 2 ? 0.0004 : -0.0004), (anchor.lng + n.lng) / 2 + (i % 2 ? -0.0004 : 0.0004)];
+      const path = [[anchor.lat, anchor.lng], mid, [n.lat, n.lng]];
+      edges.push({ id: `sec_e${edgeCounter++}`, roadName: `${anchor.name} ${suffixes[i % suffixes.length]}`, from: anchor.id, to: nid, distance: pathLengthKm(path), path, tier: 'secondary' });
+    });
+    // ring road connecting consecutive secondary nodes into a loop
+    for (let i = 0; i < localIds.length; i++) {
+      const a = nodes[localIds[i]], b = nodes[localIds[(i + 1) % localIds.length]];
+      const path = [[a.lat, a.lng], [b.lat, b.lng]];
+      edges.push({ id: `sec_e${edgeCounter++}`, roadName: `${anchor.name} Ring Road`, from: a.id, to: b.id, distance: pathLengthKm(path), path, tier: 'tertiary' });
+    }
+  });
+  return { nodes, edges };
+}
+
+function mergeGraphs(a, b) {
+  return { nodes: { ...a.nodes, ...b.nodes }, edges: [...a.edges, ...b.edges] };
+}
+
+// Distance-based polyline decimation for intersection testing. Keeping a
+// point only after we've travelled `minGapKm` since the last kept point
+// preserves local road shape — unlike fixed-count stride sampling, it can't
+// turn a long winding road into a handful of huge chords that falsely
+// "cross" unrelated streets on the other side of the city.
+function resamplePath(path, minGapKm, maxPoints = 80) {
+  if (path.length <= 2) return path;
+  const out = [path[0]]; let last = path[0];
+  for (let i = 1; i < path.length - 1; i++) {
+    if (haversine(last[0], last[1], path[i][0], path[i][1]) >= minGapKm) { out.push(path[i]); last = path[i]; }
+  }
+  out.push(path[path.length - 1]);
+  if (out.length > maxPoints) return resamplePath(path, minGapKm * 1.6, maxPoints);
+  return out;
+}
+function edgeBBox(path) {
+  let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+  for (const [lat, lng] of path) { if (lat < minLat) minLat = lat; if (lat > maxLat) maxLat = lat; if (lng < minLng) minLng = lng; if (lng > maxLng) maxLng = lng; }
+  return { minLat, maxLat, minLng, maxLng };
+}
+function bboxOverlap(a, b, buf) {
+  return !(a.maxLat + buf < b.minLat || b.maxLat + buf < a.minLat || a.maxLng + buf < b.minLng || b.maxLng + buf < a.minLng);
+}
+// Standard planar segment-segment intersection (fine at city scale).
+function segIntersect(p1, p2, p3, p4) {
+  const [y1, x1] = p1, [y2, x2] = p2, [y3, x3] = p3, [y4, x4] = p4;
+  const denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+  if (Math.abs(denom) < 1e-14) return null;
+  const t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom;
+  const u = ((x1 - x3) * (y1 - y2) - (y1 - y3) * (x1 - x2)) / denom;
+  if (t <= 0.001 || t >= 0.999 || u <= 0.001 || u >= 0.999) return null; // exclude near-endpoint "intersections" (real junctions)
+  return { lat: y1 + t * (y2 - y1), lng: x1 + t * (x2 - x1) };
+}
+
+// "Turn at any intersection" enrichment: finds every geometric crossing
+// between edge polylines (that isn't already a shared named junction),
+// merges nearby crossings within a ~13m tolerance into a single new node,
+// and splits both crossing edges there.
+function enrichGraphWithIntersections(graph, opts = {}) {
+  const maxTotalNodes = opts.maxTotalNodes ?? 198; // keep under the <200-node performance target
+  const minGapKm = opts.minGapKm ?? 0.05; // ~50m resolution for intersection testing
+
+  const edges = graph.edges.map(e => ({ ...e, _sampled: resamplePath(e.path, minGapKm) }));
+  edges.forEach(e => { e._bbox = edgeBBox(e._sampled); });
+
+  const toleranceKm = opts.toleranceKm ?? 0.013;
+  const toDeg = toleranceKm / 111;
+  const cellKey = (lat, lng) => `${Math.round(lat / toDeg)}_${Math.round(lng / toDeg)}`;
+  const clusterMap = new Map(); let clusterCounter = 0;
+  function getOrCreateClusterNode(lat, lng) {
+    const key = cellKey(lat, lng);
+    if (clusterMap.has(key)) return clusterMap.get(key);
+    const rec = { id: `xnode_${clusterCounter++}`, lat, lng };
+    clusterMap.set(key, rec);
+    return rec;
+  }
+
+  const perEdgeHits = edges.map(() => []);
+  const buf = toDeg * 1.5;
+  for (let i = 0; i < edges.length; i++) {
+    for (let j = i + 1; j < edges.length; j++) {
+      const ea = edges[i], eb = edges[j];
+      if (ea.from === eb.from || ea.from === eb.to || ea.to === eb.from || ea.to === eb.to) continue; // already meet at a real junction
+      if (!bboxOverlap(ea._bbox, eb._bbox, buf)) continue;
+      const pa = ea._sampled, pb = eb._sampled;
+      for (let si = 0; si < pa.length - 1; si++) {
+        for (let sj = 0; sj < pb.length - 1; sj++) {
+          const hit = segIntersect(pa[si], pa[si + 1], pb[sj], pb[sj + 1]);
+          if (hit) {
+            const node = getOrCreateClusterNode(hit.lat, hit.lng);
+            perEdgeHits[i].push({ node });
+            perEdgeHits[j].push({ node });
+          }
+        }
+      }
+    }
+  }
+
+  const newNodes = { ...graph.nodes };
+  const newEdges = [];
+  let nodeCount = Object.keys(newNodes).length;
+
+  edges.forEach((e, idx) => {
+    const hitsForEdge = perEdgeHits[idx];
+    if (hitsForEdge.length === 0) { newEdges.push({ id: e.id, roadName: e.roadName, from: e.from, to: e.to, distance: e.distance, path: e.path, tier: e.tier }); return; }
+
+    const fullPath = e.path;
+    // locate each hit's nearest index along the *original* (un-decimated) path
+    const withIdx = hitsForEdge.map(h => {
+      let bestIdx = 0, bestD = Infinity;
+      for (let k = 0; k < fullPath.length; k++) {
+        const d = (fullPath[k][0] - h.node.lat) ** 2 + (fullPath[k][1] - h.node.lng) ** 2;
+        if (d < bestD) { bestD = d; bestIdx = k; }
+      }
+      return { idx: bestIdx, nodeId: h.node.id, lat: h.node.lat, lng: h.node.lng };
+    });
+    // dedupe by cluster node id
+    const seen = new Set();
+    const usable = [];
+    for (const h of withIdx) {
+      if (seen.has(h.nodeId)) continue;
+      seen.add(h.nodeId);
+      if (!newNodes[h.nodeId]) {
+        if (nodeCount >= maxTotalNodes) continue; // over budget — skip this split point
+        newNodes[h.nodeId] = { id: h.nodeId, name: `Junction ${h.nodeId.replace('xnode_', '#')}`, lat: h.lat, lng: h.lng, tier: 'junction' };
+        nodeCount++;
+      }
+      usable.push(h);
+    }
+    if (usable.length === 0) { newEdges.push({ id: e.id, roadName: e.roadName, from: e.from, to: e.to, distance: e.distance, path: e.path, tier: e.tier }); return; }
+
+    // Build (idx, nodeId) stops together (never separately) so they can never
+    // drift out of sync, then collapse same-index duplicates.
+    const allStops = [
+      { idx: 0, nodeId: e.from },
+      ...usable.map(h => ({ idx: h.idx, nodeId: h.nodeId })),
+      { idx: fullPath.length - 1, nodeId: e.to },
+    ].sort((a, b) => a.idx - b.idx);
+    const stops = [];
+    for (const s of allStops) { if (stops.length && stops[stops.length - 1].idx === s.idx) continue; stops.push(s); }
+
+    let anyAdded = false;
+    for (let k = 0; k < stops.length - 1; k++) {
+      const segPath = fullPath.slice(stops[k].idx, stops[k + 1].idx + 1);
+      if (segPath.length < 2) continue;
+      anyAdded = true;
+      newEdges.push({ id: `${e.id}_${k}`, roadName: e.roadName, from: stops[k].nodeId, to: stops[k + 1].nodeId, distance: pathLengthKm(segPath), path: segPath, tier: e.tier });
+    }
+    if (!anyAdded) newEdges.push({ id: e.id, roadName: e.roadName, from: e.from, to: e.to, distance: e.distance, path: e.path, tier: e.tier });
+  });
+
+  return { nodes: newNodes, edges: newEdges };
+}
+
+/* OVERPASS IMPORT NOTE
+   A real deployment would replace generateSecondaryNetwork() with a fetch
+   against the Overpass API for `highway=residential|tertiary|unclassified`
+   ways inside Bangalore's bounding box, converted with a small adapter:
+
+     function edgesFromOverpassWays(overpassJson) { ... }  // way -> {id, roadName, from, to, distance, path}
+
+   then merged the same way: mergeGraphs(ARTERIAL_GRAPH_RAW, importedEdges).
+   The intersection enrichment below works identically either way — it only
+   cares about polylines, not where they came from. This project's sandbox
+   has no network access to Overpass, so the procedural generator above
+   stands in for that import step. */
+
+const BANGALORE_GRAPH = enrichGraphWithIntersections(
+  mergeGraphs(ARTERIAL_GRAPH_RAW, generateSecondaryNetwork(ARTERIAL_GRAPH_RAW.nodes))
+);
+
+/* Junction nodes are synthetic split points created purely so a route can
+   turn at a real-world road crossing — they aren't places anyone would set
+   as a warehouse/stop/destination, and showing them as dots or counting
+   them as "nodes visited" just adds noise. The router still uses them
+   internally (that's the whole point of turn-at-any-intersection); these
+   helpers only affect what's clickable, drawn, and counted. */
+const isJunctionNode = (id) => BANGALORE_GRAPH.nodes[id]?.tier === 'junction';
+const visibleNodeIds = (ids) => (ids || []).filter((id) => !isJunctionNode(id));
+const findNearestSelectableNode = (lat, lng, maxDist = 0.008) => {
+  let nearest = null, minDist = Infinity;
+  Object.values(BANGALORE_GRAPH.nodes).forEach((node) => {
+    if (node.tier === 'junction') return; // never selectable as a waypoint
+    const d = Math.sqrt((lat - node.lat) ** 2 + (lng - node.lng) ** 2);
+    if (d < minDist && d < maxDist) { minDist = d; nearest = node; }
+  });
+  return nearest;
+};
+
+/* ============================================================
    CORE ALGORITHMIC LOGIC — DIJKSTRA & A* SEARCH
    ============================================================ */
 function haversine(lat1, lon1, lat2, lon2) {
@@ -412,7 +767,7 @@ function runDijkstra(graph, startId, endId, trafficEdgesSet) {
   while (prev[u]) { path.unshift({ node: u, edge: prev[u].edge }); u = prev[u].node; }
   if (u === startId) path.unshift({ node: startId });
   const execTime = performance.now() - startTime;
-  return { path, distance: dist[endId], steps, nodesExplored: visited.size, execTime };
+  return { path, distance: dist[endId], steps, nodesExplored: visited.size, visitedIds: Array.from(visited), execTime };
 }
 
 function runAStar(graph, startId, endId, trafficEdgesSet) {
@@ -449,8 +804,10 @@ function runAStar(graph, startId, endId, trafficEdgesSet) {
   const path = []; let u = endId;
   while (prev[u]) { path.unshift({ node: u, edge: prev[u].edge }); u = prev[u].node; }
   if (u === startId) path.unshift({ node: startId });
+  const visitedIds = Array.from(closedSet);
+  if (path.length > 0 && !visitedIds.includes(endId)) visitedIds.push(endId);
   const execTime = performance.now() - startTime;
-  return { path, distance: gScore[endId], steps, nodesExplored: closedSet.size + openSet.length, execTime };
+  return { path, distance: gScore[endId], steps, nodesExplored: closedSet.size + openSet.length, visitedIds, execTime };
 }
 
 /* ============================================================
@@ -485,24 +842,29 @@ const createDestIcon = () => createNodeIcon('#dc2626', 'D');
    ============================================================ */
 const Navbar = () => {
   const { theme, toggleTheme } = useTheme();
+  const navLink = "text-sm font-medium text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white transition";
   return (
-    <nav className="sticky top-0 z-50 w-full border-b backdrop-blur-md bg-white/90 dark:bg-slate-900/90 border-slate-200 dark:border-slate-700 transition-colors">
+    <nav className="sticky top-0 z-50 w-full backdrop-blur-md bg-white/85 dark:bg-[#060a14]/90 transition-colors">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="flex justify-between h-16 items-center">
-          <div className="flex items-center gap-2">
-            <RouteIcon className="w-6 h-6 text-blue-600 dark:text-blue-400" />
-            <span className="text-xl font-bold bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent dark:from-blue-400 dark:to-indigo-400">AeroRoute BLR</span>
-          </div>
-          <div className="hidden md:flex items-center gap-8">
-            <Link to="/" className="text-sm font-medium text-slate-600 hover:text-blue-600 dark:text-slate-300 dark:hover:text-blue-400 transition">Home</Link>
-            <Link to="/info" className="text-sm font-medium text-slate-600 hover:text-blue-600 dark:text-slate-300 dark:hover:text-blue-400 transition">Info</Link>
-            <Link to="/project" className="text-sm font-medium text-slate-600 hover:text-blue-600 dark:text-slate-300 dark:hover:text-blue-400 transition">Map</Link>
-            <button onClick={toggleTheme} className="p-2 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition">
+          <Link to="/" className="flex items-center gap-2.5">
+            <span className="relative flex h-6 w-6 items-center justify-center">
+              <Compass size={22} className="text-[var(--cyan-deep)] dark:text-[var(--cyan)]" strokeWidth={2} />
+            </span>
+            <span className="font-display font-semibold text-lg text-slate-900 dark:text-white">AeroRoute <span className="text-[var(--cyan-deep)] dark:text-[var(--cyan)]">BLR</span></span>
+          </Link>
+          <div className="hidden md:flex items-center gap-7">
+            <Link to="/" className={navLink}>Home</Link>
+            <Link to="/info" className={navLink}>Foundations</Link>
+            <Link to="/visualization" className={navLink}>Visualize</Link>
+            <Link to="/project" className="text-sm font-medium px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:border-[var(--cyan-deep)] hover:text-[var(--cyan-deep)] dark:hover:border-[var(--cyan)] dark:hover:text-[var(--cyan)] transition">Live Map</Link>
+            <button onClick={toggleTheme} className="p-2 rounded-lg bg-slate-100 dark:bg-slate-800/80 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition" aria-label="Toggle theme">
               {theme === 'light' ? <Moon size={18} /> : <Sun size={18} />}
             </button>
           </div>
         </div>
       </div>
+      <div className="h-px w-full opacity-70" style={{ background: 'var(--route-line)' }} />
     </nav>
   );
 };
@@ -512,55 +874,105 @@ const Navbar = () => {
    ============================================================ */
 const HomePage = () => {
   const navigate = useNavigate();
+  const nodeCount = Object.keys(BANGALORE_GRAPH.nodes).length;
+  const edgeCount = BANGALORE_GRAPH.edges.length;
+  const minorCount = Object.values(BANGALORE_GRAPH.nodes).filter(n => n.tier).length;
+
+  const waypoints = [
+    { icon: <Layers size={18} />, label: 'STACK', title: 'React & Tailwind', desc: 'Functional components with Hooks, responsive dark-aware styling.' },
+    { icon: <MapPin size={18} />, label: 'MAP LAYER', title: 'OpenStreetMap & Leaflet', desc: 'Bengaluru road geometry, rendered as real curved polylines.' },
+    { icon: <Waypoints size={18} />, label: 'GRAPH', title: `${nodeCount}-node road graph`, desc: `Arterial roads plus procedurally added residential streets, split at every real intersection.` },
+    { icon: <BarChart3 size={18} />, label: 'ENGINE', title: 'Dijkstra vs A*', desc: 'Custom traversal with step-by-step playback, side-by-side comparison, and analytics.' },
+  ];
+
   return (
-    <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white dark:from-slate-950 dark:to-slate-900 transition-colors">
-      <div className="max-w-7xl mx-auto px-4 pt-20 pb-16 text-center">
-        <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 text-sm font-medium mb-6 border border-blue-100 dark:border-blue-800">
-          <Zap size={16} /> DAA Lab PBL 
+    <div className="min-h-screen bg-white dark:bg-slate-950 transition-colors">
+      {/* HERO — fixed dark "instrument panel", independent of site theme */}
+      <div className="relative overflow-hidden" style={{ background: 'var(--ink)' }}>
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-20 pb-16 grid lg:grid-cols-2 gap-12 items-center">
+          <div className="fade-up">
+            <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full border border-slate-700 text-[var(--cyan)] font-data text-xs tracking-wide mb-6">
+              <Zap size={13} /> PATHFINDING LAB &middot; BENGALURU ROAD NETWORK
+            </div>
+            <h1 className="font-display font-semibold text-4xl md:text-5xl lg:text-6xl text-white leading-[1.05] mb-6">
+              Dijkstra and A*,<br />racing on real streets.
+            </h1>
+            <p className="text-lg text-slate-400 max-w-xl mb-8 leading-relaxed font-body">
+              AeroRoute BLR turns Bengaluru&apos;s arterial roads into a live graph, then lets you watch two classic
+              search algorithms find their way across it, node by node, in the open.
+            </p>
+            <div className="flex flex-wrap items-center gap-4 mb-10">
+              <button onClick={() => navigate('/project')} className="group inline-flex items-center gap-2 px-6 py-3 bg-[var(--cyan)] hover:bg-cyan-300 text-slate-950 rounded-lg font-semibold transition-all">
+                Open the live map <ChevronRight size={18} className="group-hover:translate-x-1 transition" />
+              </button>
+              <button onClick={() => navigate('/visualization')} className="inline-flex items-center gap-2 px-6 py-3 border border-slate-700 hover:border-slate-500 text-slate-200 rounded-lg font-medium transition-all">
+                See how the algorithms work
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-x-8 gap-y-2 font-data text-sm text-slate-400 border-t border-slate-800 pt-5">
+              <span><span className="text-white font-medium">{nodeCount}</span> nodes</span>
+              <span><span className="text-white font-medium">{edgeCount}</span> road segments</span>
+              <span><span className="text-white font-medium">{minorCount}</span> auto-split intersections</span>
+              <span><span className="text-white font-medium">2</span> search algorithms</span>
+            </div>
+          </div>
+          <div className="hidden lg:flex justify-center fade-up" style={{ animationDelay: '0.15s' }}>
+            <GraphPulse className="w-full max-w-md" />
+          </div>
         </div>
-        <h1 className="text-5xl md:text-7xl font-extrabold tracking-tight text-slate-900 dark:text-white mb-6">AeroRoute <span className="text-blue-600 dark:text-blue-400">BLR</span></h1>
-        <p className="text-xl md:text-2xl text-slate-600 dark:text-slate-300 max-w-3xl mx-auto mb-10 leading-relaxed">
-          Real-Time Multi-Algorithmic Urban Logistics Optimizer.<br/>
-          <span className="text-blue-600 dark:text-blue-400 font-semibold">Visualizing Dijkstra vs A* on Bangalore&apos;s arterial road network.</span>
-        </p>
-        <button onClick={() => navigate('/project')} className="group inline-flex items-center gap-3 px-8 py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold text-lg transition-all shadow-lg hover:shadow-blue-500/25 hover:-translate-y-0.5">
-          Launch Optimizer <ChevronRight className="group-hover:translate-x-1 transition" />
-        </button>
+        <div className="h-px w-full opacity-60" style={{ background: 'var(--route-line)' }} />
       </div>
-      <div className="max-w-6xl mx-auto px-4 py-16">
-        <div className="bg-white dark:bg-slate-800 rounded-2xl p-8 md:p-12 shadow-xl border border-slate-100 dark:border-slate-700">
-          <h2 className="text-2xl font-bold text-slate-900 dark:text-white mb-4 flex items-center gap-2">
-            <GitGraph className="text-blue-600" /> Core Problem Statement
-          </h2>
-          <p className="text-slate-600 dark:text-slate-300 leading-relaxed text-lg">
-            Urban logistics in Bangalore faces a critical challenge: finding optimal delivery routes through 
-            dense, high-traffic arterial roads. This project models the city as a weighted road graph and 
-            compares <strong>Dijkstra&apos;s Algorithm</strong> (uniform cost exploration) against 
-            <strong> A* Search</strong> (heuristic-driven target tracking) for multi-stop route planning. 
-            Users can simulate heavy traffic conditions, place dynamic waypoints, and observe how each 
-            algorithm navigates Bangalore&apos;s unique road geometry in real-time.
+
+      {/* BRIEF */}
+      <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-16">
+        <div className="border border-slate-200 dark:border-slate-800 rounded-2xl p-8 md:p-10 bg-slate-50 dark:bg-slate-900/50">
+          <div className="font-data text-xs tracking-wide text-slate-400 dark:text-slate-500 mb-3">PROJECT_BRIEF</div>
+          <h2 className="font-display font-semibold text-2xl text-slate-900 dark:text-white mb-4">The problem</h2>
+          <p className="text-slate-600 dark:text-slate-300 leading-relaxed text-lg font-body">
+            Commercial navigation apps hide their reasoning, they hand you a route without showing the search
+            that found it. This project models Bengaluru as a weighted road graph and runs <strong className="text-slate-900 dark:text-white">Dijkstra&apos;s
+            Algorithm</strong> (uniform-cost exploration) side by side with <strong className="text-slate-900 dark:text-white">A* Search</strong> (heuristic-guided
+            target tracking), so the search itself frontier, visited set, and all is the thing you get to watch.
           </p>
         </div>
       </div>
-      <div className="max-w-6xl mx-auto px-4 pb-20">
-        <h3 className="text-center text-2xl font-bold text-slate-900 dark:text-white mb-10">Tech Stack & Architecture</h3>
-        <div className="grid md:grid-cols-3 gap-6">
-          {[
-            { icon: <Layers className="w-8 h-8 text-blue-600" />, title: 'React & Tailwind', desc: 'Functional components with Hooks, responsive dark-aware styling' },
-            { icon: <MapPin className="w-8 h-8 text-green-600" />, title: 'OpenStreetMap & Leaflet', desc: 'Real-world Bangalore road layer with curved polyline rendering' },
-            { icon: <BarChart3 className="w-8 h-8 text-purple-600" />, title: 'Dijkstra vs A* Engine', desc: 'Custom graph traversal with step-by-step animation & analytics' }
-          ].map((item, i) => (
-            <div key={i} className="bg-white dark:bg-slate-800 p-6 rounded-xl border border-slate-100 dark:border-slate-700 shadow-sm hover:shadow-md transition">
-              <div className="mb-4 p-3 bg-slate-50 dark:bg-slate-700 rounded-lg w-fit">{item.icon}</div>
-              <h4 className="font-bold text-slate-900 dark:text-white mb-2">{item.title}</h4>
-              <p className="text-slate-600 dark:text-slate-400 text-sm">{item.desc}</p>
+
+      {/* ROUTE ITINERARY — features laid out like stops on a route */}
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 pb-20">
+        <h3 className="font-display font-semibold text-2xl text-slate-900 dark:text-white mb-10 text-center">How it&apos;s built</h3>
+        <div className="grid md:grid-cols-4 gap-0 relative">
+          <div className="hidden md:block absolute top-6 left-[12%] right-[12%] h-px border-t-2 border-dashed border-slate-300 dark:border-slate-700" />
+          {waypoints.map((w, i) => (
+            <div key={i} className="relative flex flex-col items-center text-center px-4 pb-2">
+              <div className="relative z-10 w-12 h-12 rounded-full bg-white dark:bg-slate-950 border-2 border-slate-300 dark:border-slate-700 flex items-center justify-center text-[var(--cyan-deep)] dark:text-[var(--cyan)] mb-4">
+                {w.icon}
+              </div>
+              <div className="font-data text-[10px] tracking-wider text-slate-400 dark:text-slate-500 mb-1">{w.label}</div>
+              <h4 className="font-semibold text-slate-900 dark:text-white mb-1.5">{w.title}</h4>
+              <p className="text-slate-500 dark:text-slate-400 text-sm leading-relaxed">{w.desc}</p>
             </div>
           ))}
         </div>
       </div>
-      <footer className="border-t border-slate-200 dark:border-slate-800 py-8 text-center text-slate-500 dark:text-slate-400 text-sm">
-        <p>Developed for DAA Lab PBL &bull; 2026</p>
-        <p className="mt-1 font-medium text-slate-700 dark:text-slate-300">Designed & Engineered to Optimize Logistics</p>
+
+      {/* CTA BAND */}
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 pb-20 grid sm:grid-cols-2 gap-5">
+        <Link to="/visualization" className="group rounded-2xl border border-slate-200 dark:border-slate-800 p-7 hover:border-[var(--violet)] transition-colors bg-white dark:bg-slate-900/40">
+          <div className="font-data text-xs tracking-wide text-[var(--violet)] mb-2">ALGORITHM LAB</div>
+          <h4 className="font-display font-semibold text-xl text-slate-900 dark:text-white mb-2">Visualize the search</h4>
+          <p className="text-slate-500 dark:text-slate-400 text-sm mb-4">An abstract graph, both algorithms running at once, plus complexity and pseudocode side by side.</p>
+          <span className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-700 dark:text-slate-300 group-hover:text-[var(--violet)] transition-colors">Explore <ChevronRight size={15} className="group-hover:translate-x-1 transition" /></span>
+        </Link>
+        <Link to="/project" className="group rounded-2xl border border-slate-200 dark:border-slate-800 p-7 hover:border-[var(--cyan-deep)] dark:hover:border-[var(--cyan)] transition-colors bg-white dark:bg-slate-900/40">
+          <div className="font-data text-xs tracking-wide text-[var(--cyan-deep)] dark:text-[var(--cyan)] mb-2">LIVE MAP</div>
+          <h4 className="font-display font-semibold text-xl text-slate-900 dark:text-white mb-2">Route Bengaluru</h4>
+          <p className="text-slate-500 dark:text-slate-400 text-sm mb-4">Place a warehouse, stops and a destination on the real road network, then compute the route.</p>
+          <span className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-700 dark:text-slate-300 group-hover:text-[var(--cyan-deep)] dark:group-hover:text-[var(--cyan)] transition-colors">Open map <ChevronRight size={15} className="group-hover:translate-x-1 transition" /></span>
+        </Link>
+      </div>
+
+      <footer className="border-t border-slate-200 dark:border-slate-800 py-8 text-center font-data text-xs text-slate-400 dark:text-slate-500">
+        <p>DAA LAB PBL &middot; 2026</p>
       </footer>
     </div>
   );
@@ -569,46 +981,54 @@ const HomePage = () => {
 /* ============================================================
    PAGE 2: HOW IT WORKS (INFO PAGE)
    ============================================================ */
+const ALGORITHMS_INFO = {
+  dijkstra: {
+    name: "Dijkstra's Algorithm", paradigm: "Greedy / Dynamic Programming", timeComplexity: "O((V + E) log V) with binary heap", spaceComplexity: "O(V) for distance array + O(V) for priority queue",
+    description: "Explores all possible paths uniformly outward from the source. It maintains a set of unvisited nodes and always expands the node with the smallest tentative distance. Guaranteed to find the shortest path in graphs with non-negative weights.",
+    pseudocode: ["1. Initialize dist[source] = 0, dist[v] = \u221e for all other nodes","2. Insert source into min-priority queue Q","3. While Q is not empty:","4.   u = extract-min(Q) // node with smallest dist","5.   For each neighbor v of u:","6.     alt = dist[u] + weight(u,v)","7.     If alt < dist[v]:","8.       dist[v] = alt","9.       prev[v] = u","10.      decrease-key(Q, v, alt)","11. Return dist[] and reconstruct path via prev[]"]
+  },
+  astar: {
+    name: "A* Search Algorithm", paradigm: "Informed Search / Best-First Search", timeComplexity: "O(E) worst-case, significantly better with good heuristic", spaceComplexity: "O(V) for open/closed sets + g/f score arrays",
+    description: "Extends Dijkstra by adding a heuristic function h(n) that estimates the cost from the current node to the goal. In this project, h(n) is the Haversine (great-circle) geographic distance. A* prioritizes nodes that appear closer to the destination, often exploring far fewer nodes than Dijkstra.",
+    pseudocode: ["1. Initialize g[source] = 0, f[source] = h(source, goal)","2. openSet = {source}, closedSet = {}","3. While openSet is not empty:","4.   current = node in openSet with lowest f-score","5.   If current == goal: return path","6.   Move current from openSet to closedSet","7.   For each neighbor of current:","8.     If neighbor in closedSet: continue","9.     tentative_g = g[current] + weight(current, neighbor)","10.    If tentative_g < g[neighbor] or neighbor not in openSet:","11.      prev[neighbor] = current","12.      g[neighbor] = tentative_g","13.      f[neighbor] = g[neighbor] + h(neighbor, goal)","14.      If neighbor not in openSet: add to openSet","15. Return failure if openSet empties"]
+  }
+};
+
 const InfoPage = () => {
   const [activeTab, setActiveTab] = useState('dijkstra');
-  const algorithms = {
-    dijkstra: {
-      name: "Dijkstra's Algorithm", paradigm: "Greedy / Dynamic Programming", timeComplexity: "O((V + E) log V) with binary heap", spaceComplexity: "O(V) for distance array + O(V) for priority queue",
-      description: "Explores all possible paths uniformly outward from the source. It maintains a set of unvisited nodes and always expands the node with the smallest tentative distance. Guaranteed to find the shortest path in graphs with non-negative weights.",
-      pseudocode: ["1. Initialize dist[source] = 0, dist[v] = \u221e for all other nodes","2. Insert source into min-priority queue Q","3. While Q is not empty:","4.   u = extract-min(Q) // node with smallest dist","5.   For each neighbor v of u:","6.     alt = dist[u] + weight(u,v)","7.     If alt < dist[v]:","8.       dist[v] = alt","9.       prev[v] = u","10.      decrease-key(Q, v, alt)","11. Return dist[] and reconstruct path via prev[]"]
-    },
-    astar: {
-      name: "A* Search Algorithm", paradigm: "Informed Search / Best-First Search", timeComplexity: "O(E) worst-case, significantly better with good heuristic", spaceComplexity: "O(V) for open/closed sets + g/f score arrays",
-      description: "Extends Dijkstra by adding a heuristic function h(n) that estimates the cost from the current node to the goal. In this project, h(n) is the Haversine (great-circle) geographic distance. A* prioritizes nodes that appear closer to the destination, often exploring far fewer nodes than Dijkstra.",
-      pseudocode: ["1. Initialize g[source] = 0, f[source] = h(source, goal)","2. openSet = {source}, closedSet = {}","3. While openSet is not empty:","4.   current = node in openSet with lowest f-score","5.   If current == goal: return path","6.   Move current from openSet to closedSet","7.   For each neighbor of current:","8.     If neighbor in closedSet: continue","9.     tentative_g = g[current] + weight(current, neighbor)","10.    If tentative_g < g[neighbor] or neighbor not in openSet:","11.      prev[neighbor] = current","12.      g[neighbor] = tentative_g","13.      f[neighbor] = g[neighbor] + h(neighbor, goal)","14.      If neighbor not in openSet: add to openSet","15. Return failure if openSet empties"]
-    }
-  };
+  const algorithms = ALGORITHMS_INFO;
   const current = algorithms[activeTab];
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-slate-950 py-12 px-4 transition-colors">
       <div className="max-w-5xl mx-auto">
-        <h1 className="text-4xl font-bold text-slate-900 dark:text-white mb-2 text-center">Algorithmic Foundations</h1>
-        <p className="text-center text-slate-600 dark:text-slate-400 mb-12">Mathematical models powering the Bangalore logistics engine</p>
+        <div className="font-data text-xs tracking-wide text-slate-400 dark:text-slate-500 text-center mb-2">ALGORITHMIC_FOUNDATIONS</div>
+        <h1 className="font-display font-semibold text-4xl text-slate-900 dark:text-white mb-2 text-center">How the search engine works</h1>
+        <p className="text-center text-slate-600 dark:text-slate-400 mb-12">The two traversal strategies powering the Bengaluru routing engine</p>
         <div className="flex gap-4 mb-8 justify-center">
-          <button onClick={() => setActiveTab('dijkstra')} className={`px-6 py-3 rounded-lg font-semibold transition ${activeTab === 'dijkstra' ? 'bg-blue-600 text-white shadow-lg' : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700'}`}>Dijkstra&apos;s Algorithm</button>
-          <button onClick={() => setActiveTab('astar')} className={`px-6 py-3 rounded-lg font-semibold transition ${activeTab === 'astar' ? 'bg-blue-600 text-white shadow-lg' : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700'}`}>A* Search</button>
+          <button onClick={() => setActiveTab('dijkstra')} className={`px-6 py-3 rounded-lg font-semibold transition ${activeTab === 'dijkstra' ? 'bg-[var(--amber)] text-slate-950 shadow-lg' : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700'}`}>Dijkstra&apos;s Algorithm</button>
+          <button onClick={() => setActiveTab('astar')} className={`px-6 py-3 rounded-lg font-semibold transition ${activeTab === 'astar' ? 'bg-[var(--violet)] text-slate-950 shadow-lg' : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700'}`}>A* Search</button>
         </div>
         <div className="bg-white dark:bg-slate-800 rounded-2xl p-8 shadow-xl border border-slate-100 dark:border-slate-700">
           <div className="grid md:grid-cols-2 gap-8 mb-8">
             <div>
-              <h2 className="text-2xl font-bold text-slate-900 dark:text-white mb-4">{current.name}</h2>
+              <h2 className="font-display font-semibold text-2xl text-slate-900 dark:text-white mb-4">{current.name}</h2>
               <div className="space-y-3">
                 <div className="flex justify-between py-2 border-b border-slate-100 dark:border-slate-700"><span className="text-slate-500 dark:text-slate-400">Paradigm</span><span className="font-medium text-slate-900 dark:text-slate-200">{current.paradigm}</span></div>
-                <div className="flex justify-between py-2 border-b border-slate-100 dark:border-slate-700"><span className="text-slate-500 dark:text-slate-400">Time Complexity</span><span className="font-mono font-medium text-blue-600 dark:text-blue-400">{current.timeComplexity}</span></div>
-                <div className="flex justify-between py-2 border-b border-slate-100 dark:border-slate-700"><span className="text-slate-500 dark:text-slate-400">Space Complexity</span><span className="font-mono font-medium text-purple-600 dark:text-purple-400">{current.spaceComplexity}</span></div>
+                <div className="flex justify-between py-2 border-b border-slate-100 dark:border-slate-700"><span className="text-slate-500 dark:text-slate-400">Time Complexity</span><span className="font-data text-sm font-medium text-[var(--cyan-deep)] dark:text-[var(--cyan)]">{current.timeComplexity}</span></div>
+                <div className="flex justify-between py-2 border-b border-slate-100 dark:border-slate-700"><span className="text-slate-500 dark:text-slate-400">Space Complexity</span><span className="font-data text-sm font-medium text-[var(--violet)]">{current.spaceComplexity}</span></div>
               </div>
               <p className="mt-6 text-slate-600 dark:text-slate-300 leading-relaxed">{current.description}</p>
             </div>
             <div className="bg-slate-900 rounded-xl p-6 overflow-auto">
               <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-4">Logic & Pseudocode</h3>
-              <pre className="font-mono text-sm text-green-400 leading-relaxed">{current.pseudocode.join('\n')}</pre>
+              <pre className="font-data text-sm text-green-400 leading-relaxed">{current.pseudocode.join('\n')}</pre>
             </div>
           </div>
+        </div>
+        <div className="mt-8 flex items-center justify-center">
+          <Link to="/visualization" className="inline-flex items-center gap-2 text-sm font-medium text-slate-600 dark:text-slate-300 hover:text-[var(--cyan-deep)] dark:hover:text-[var(--cyan)] transition">
+            Want to see both algorithms run side by side on an abstract graph? <ChevronRight size={16} />
+          </Link>
         </div>
       </div>
     </div>
@@ -619,6 +1039,134 @@ const InfoPage = () => {
 /* ============================================================
    PAGE 3: MAIN VISUALIZER DASHBOARD
    ============================================================ */
+/* ============================================================
+   COMPARE PANEL — one algorithm's map + live playback, used twice
+   side-by-side by VisualizerPage's Compare mode.
+   ============================================================ */
+const COMPARE_PALETTES = {
+  dijkstra: { frontier: '#fbbf24', frontierBorder: '#b45309', visited: '#60a5fa', visitedBorder: '#1e40af', path: '#f59e0b', label: 'Dijkstra' },
+  astar: { frontier: '#f472b6', frontierBorder: '#9d174d', visited: '#c084fc', visitedBorder: '#6b21a8', path: '#8b5cf6', label: 'A* Search' },
+};
+
+const ComparePanel = ({ algorithm, warehouse, stops, destination, trafficEdges, activeTool, setActiveTool, onSetWarehouse, onAddStop, onSetDestination, onToggleTraffic, speed, computeSignal, onStats }) => {
+  const [vizState, setVizState] = useState({ status: 'idle', frontier: [], visited: [], activeEdges: [], primaryPath: [], currentStep: 0, totalSteps: 0 });
+  const [analytics, setAnalytics] = useState(null);
+  const palette = COMPARE_PALETTES[algorithm];
+  const speedRef = useRef(speed);
+  useEffect(() => { speedRef.current = speed; }, [speed]);
+
+  const ClickHandler = () => {
+    useMapEvent('click', (e) => {
+      const { lat, lng } = e.latlng;
+      const nearest = findNearestSelectableNode(lat, lng);
+      if (!nearest) return;
+      if (activeTool === 'warehouse') { onSetWarehouse(nearest.id); setActiveTool(null); }
+      else if (activeTool === 'stop') { onAddStop(nearest.id); setActiveTool(null); }
+      else if (activeTool === 'destination') { onSetDestination(nearest.id); setActiveTool(null); }
+    });
+    return null;
+  };
+
+  useEffect(() => {
+    if (computeSignal === 0) return;
+    let cancelled = false;
+    (async () => {
+      if (!warehouse || !destination) return;
+      setAnalytics(null);
+      setVizState(prev => ({ ...prev, status: 'running', primaryPath: [] }));
+      onStats({ status: 'running', nodesExplored: 0, distance: null, execTime: null });
+      const sequence = [warehouse, ...stops, destination];
+      let fullPath = []; let totalDistance = 0; let totalNodesExplored = 0; let totalExecTime = 0;
+      for (let i = 0; i < sequence.length - 1; i++) {
+        if (cancelled) return;
+        const start = sequence[i], end = sequence[i + 1];
+        const algoStart = performance.now();
+        const result = algorithm === 'dijkstra' ? runDijkstra(BANGALORE_GRAPH, start, end, trafficEdges) : runAStar(BANGALORE_GRAPH, start, end, trafficEdges);
+        totalExecTime += performance.now() - algoStart;
+        totalDistance += result.distance; totalNodesExplored += visibleNodeIds(result.visitedIds).length;
+        for (let j = 0; j < result.steps.length; j++) {
+          if (cancelled) return;
+          const step = result.steps[j];
+          const visibleVisited = visibleNodeIds(step.visited);
+          setVizState({ status: 'running', frontier: visibleNodeIds(step.frontier), visited: visibleVisited, activeEdges: step.type === 'explore' ? [step.edge] : [], primaryPath: fullPath, currentStep: j, totalSteps: result.steps.length });
+          onStats({ status: 'running', nodesExplored: visibleVisited.length, distance: null, execTime: null });
+          await new Promise(r => setTimeout(r, speedRef.current));
+        }
+        if (fullPath.length > 0 && result.path.length > 0) fullPath = [...fullPath, ...result.path.slice(1)];
+        else fullPath = result.path;
+      }
+      if (cancelled) return;
+      setVizState({ status: 'done', frontier: [], visited: [], activeEdges: [], primaryPath: fullPath, currentStep: 0, totalSteps: 0 });
+      const roads = getRoadNames(fullPath);
+      setAnalytics({ totalDistance: totalDistance.toFixed(2), nodesExplored: totalNodesExplored, execTime: totalExecTime.toFixed(2), roadsCount: roads.length });
+      onStats({ status: 'done', nodesExplored: totalNodesExplored, distance: totalDistance.toFixed(2), execTime: totalExecTime.toFixed(2) });
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [computeSignal]);
+
+  const getNodePos = (id) => { const n = BANGALORE_GRAPH.nodes[id]; return [n.lat, n.lng]; };
+  const getPathPositions = (path) => {
+    if (!path || path.length < 2) return [];
+    const positions = [];
+    for (let i = 0; i < path.length - 1; i++) {
+      const from = path[i].node; const to = path[i + 1].node;
+      const edge = BANGALORE_GRAPH.edges.find(e => (e.from === from && e.to === to) || (e.from === to && e.to === from));
+      if (edge) { const pathCoords = edge.from === from ? edge.path : [...edge.path].reverse(); if (i === 0) positions.push(...pathCoords); else positions.push(...pathCoords.slice(1)); }
+    }
+    return positions;
+  };
+  const primaryPositions = getPathPositions(vizState.primaryPath);
+
+  return (
+    <div className="flex-1 relative border-r border-slate-200 dark:border-slate-700 last:border-r-0">
+      <div className="absolute top-3 left-1/2 -translate-x-1/2 z-[1000] px-3 py-1 rounded-full text-xs font-bold text-white shadow" style={{ background: palette.path }}>{palette.label}</div>
+      <MapContainer center={[12.9716, 77.5946]} zoom={12} className="w-full h-full z-0">
+        <TileLayer attribution='&copy; <a href="https://osm.org/copyright">OpenStreetMap</a>' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+        <ClickHandler />
+        {BANGALORE_GRAPH.edges.map(edge => {
+          const isTraffic = trafficEdges.has(edge.id);
+          const isActive = vizState.activeEdges.includes(edge.id);
+          const inPrimary = vizState.primaryPath.some((p, i) => {
+            if (i >= vizState.primaryPath.length - 1) return false;
+            const from = p.node; const to = vizState.primaryPath[i + 1].node;
+            return (edge.from === from && edge.to === to) || (edge.from === to && edge.to === from);
+          });
+          let color = '#94a3b8'; let weight = 3; let opacity = 0.5;
+          if (edge.tier === 'secondary' || edge.tier === 'tertiary') { weight = 1.5; opacity = 0.3; }
+          if (isTraffic) { color = '#ef4444'; weight = 5; opacity = 0.9; }
+          else if (inPrimary) { color = palette.path; weight = 6; opacity = 1; }
+          else if (isActive) { color = palette.frontier; weight = 5; opacity = 1; }
+          return <Polyline key={edge.id} positions={edge.path} pathOptions={{ color, weight, opacity, lineCap: 'round', lineJoin: 'round' }} eventHandlers={{ click: () => onToggleTraffic(edge.id) }} />;
+        })}
+        {Object.values(BANGALORE_GRAPH.nodes).filter(node => node.tier !== 'junction').map(node => {
+          const isFrontier = vizState.frontier.includes(node.id);
+          const isVisited = vizState.visited.includes(node.id);
+          const isMinor = node.tier === 'secondary' || node.tier === 'tertiary';
+          let fillColor = isMinor ? '#cbd5e1' : '#ffffff'; let color = '#64748b'; let radius = isMinor ? 2 : 4;
+          if (node.id === warehouse) { fillColor = '#16a34a'; color = '#14532d'; radius = 7; }
+          else if (stops.includes(node.id)) { fillColor = '#2563eb'; color = '#1e3a8a'; radius = 6; }
+          else if (node.id === destination) { fillColor = '#dc2626'; color = '#7f1d1d'; radius = 7; }
+          else if (isFrontier) { fillColor = palette.frontier; color = palette.frontierBorder; radius = 6; }
+          else if (isVisited) { fillColor = palette.visited; color = palette.visitedBorder; radius = 5; }
+          return <CircleMarker key={node.id} center={[node.lat, node.lng]} radius={radius} pathOptions={{ fillColor, color, weight: 1, fillOpacity: 0.85 }} />;
+        })}
+        {warehouse && <Marker position={getNodePos(warehouse)} icon={createWarehouseIcon()} />}
+        {stops.map((stopId, idx) => <Marker key={stopId} position={getNodePos(stopId)} icon={createStopIcon(idx + 1)} />)}
+        {destination && <Marker position={getNodePos(destination)} icon={createDestIcon()} />}
+        {primaryPositions.length > 0 && <Polyline positions={primaryPositions} pathOptions={{ color: palette.path, weight: 4, opacity: 1, lineCap: 'round' }} />}
+      </MapContainer>
+      <div className="absolute bottom-3 left-3 z-[1000] bg-white/95 dark:bg-slate-900/95 backdrop-blur rounded-lg shadow px-3 py-2 text-xs">
+        {analytics ? (
+          <div className="font-semibold text-slate-700 dark:text-slate-200">{analytics.totalDistance} km &middot; {analytics.nodesExplored} nodes &middot; {analytics.execTime} ms</div>
+        ) : (
+          <div className="text-slate-400">{vizState.status === 'running' ? `Exploring\u2026 ${vizState.visited.length} nodes` : 'Waiting to compute'}</div>
+        )}
+      </div>
+    </div>
+  );
+};
+
 const VisualizerPage = () => {
   const [activeTool, setActiveTool] = useState(null);
   const [warehouse, setWarehouse] = useState(null);
@@ -632,14 +1180,24 @@ const VisualizerPage = () => {
   const [analytics, setAnalytics] = useState(null);
   const [roadNames, setRoadNames] = useState([]);
 
+  // ---- Side-by-side comparison mode ----
+  const [mode, setMode] = useState('single'); // 'single' | 'compare'
+  const [compareSpeedLeft, setCompareSpeedLeft] = useState(120);
+  const [compareSpeedRight, setCompareSpeedRight] = useState(120);
+  const [syncCompareSpeed, setSyncCompareSpeed] = useState(true);
+  const [computeSignal, setComputeSignal] = useState(0);
+  const [compareStats, setCompareStats] = useState({ dijkstra: null, astar: null });
+
+  const addStop = (id) => {
+    setStops(prev => (id !== warehouse && id !== destination && !prev.includes(id)) ? [...prev, id] : prev);
+  };
+  const setLeftSpeed = (v) => { setCompareSpeedLeft(v); if (syncCompareSpeed) setCompareSpeedRight(v); };
+  const setRightSpeed = (v) => { setCompareSpeedRight(v); if (syncCompareSpeed) setCompareSpeedLeft(v); };
+
   const MapClickHandler = () => {
     useMapEvent('click', (e) => {
       const { lat, lng } = e.latlng;
-      let nearest = null; let minDist = Infinity;
-      Object.values(BANGALORE_GRAPH.nodes).forEach(node => {
-        const d = Math.sqrt((lat - node.lat)**2 + (lng - node.lng)**2);
-        if (d < minDist && d < 0.008) { minDist = d; nearest = node; }
-      });
+      const nearest = findNearestSelectableNode(lat, lng);
       if (!nearest) return;
       if (activeTool === 'warehouse') { setWarehouse(nearest.id); setActiveTool(null); }
       else if (activeTool === 'stop') { if (nearest.id !== warehouse && nearest.id !== destination && !stops.includes(nearest.id)) setStops(prev => [...prev, nearest.id]); setActiveTool(null); }
@@ -658,6 +1216,7 @@ const VisualizerPage = () => {
     setWarehouse(null); setStops([]); setDestination(null); setTrafficEdges(new Set());
     setVizState({ status:'idle', frontier:[], visited:[], activeEdges:[], primaryPath:[], alternatePath:[], currentStep:0, totalSteps:0 });
     setAnalytics(null); setRoadNames([]);
+    setCompareStats({ dijkstra: null, astar: null }); setComputeSignal(0);
   };
 
   /* ========================================================
@@ -681,11 +1240,11 @@ const VisualizerPage = () => {
       if (algorithm === 'dijkstra') result = runDijkstra(BANGALORE_GRAPH, start, end, trafficEdges);
       else result = runAStar(BANGALORE_GRAPH, start, end, trafficEdges);
       totalExecTime += performance.now() - algoStart;
-      totalDistance += result.distance; totalNodesExplored += result.nodesExplored;
+      totalDistance += result.distance; totalNodesExplored += visibleNodeIds(result.visitedIds).length;
 
       for (let j = 0; j < result.steps.length; j++) {
         const step = result.steps[j];
-        setVizState({ status:'running', frontier:step.frontier||[], visited:step.visited||[], activeEdges:step.type==='explore'?[step.edge]:[], primaryPath:fullPath, alternatePath:[], currentStep:j, totalSteps:result.steps.length });
+        setVizState({ status:'running', frontier:visibleNodeIds(step.frontier), visited:visibleNodeIds(step.visited), activeEdges:step.type==='explore'?[step.edge]:[], primaryPath:fullPath, alternatePath:[], currentStep:j, totalSteps:result.steps.length });
         await new Promise(r => setTimeout(r, speed));
       }
 
@@ -737,28 +1296,58 @@ const VisualizerPage = () => {
       <div className="bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-700 p-4 shadow-sm z-10">
         <div className="max-w-[1920px] mx-auto flex flex-wrap items-center gap-4 justify-between">
           <div className="flex items-center gap-4">
-            <h2 className="text-lg font-bold text-slate-800 dark:text-white flex items-center gap-2">
-              <Navigation className="text-blue-600" size={20} /> Route Optimizer
+            <h2 className="text-lg font-display font-semibold text-slate-800 dark:text-white flex items-center gap-2">
+              <Navigation className="text-[var(--cyan-deep)] dark:text-[var(--cyan)]" size={20} /> Route Optimizer
             </h2>
             <div className="flex bg-slate-100 dark:bg-slate-800 rounded-lg p-1">
-              <button onClick={() => setAlgorithm('dijkstra')} className={`px-3 py-1.5 rounded-md text-sm font-medium transition ${algorithm === 'dijkstra' ? 'bg-white dark:bg-slate-700 text-blue-600 shadow-sm' : 'text-slate-500 dark:text-slate-400'}`}>Dijkstra</button>
-              <button onClick={() => setAlgorithm('astar')} className={`px-3 py-1.5 rounded-md text-sm font-medium transition ${algorithm === 'astar' ? 'bg-white dark:bg-slate-700 text-blue-600 shadow-sm' : 'text-slate-500 dark:text-slate-400'}`}>A* Search</button>
+              <button onClick={() => setMode('single')} className={`px-3 py-1.5 rounded-md text-sm font-medium transition ${mode === 'single' ? 'bg-white dark:bg-slate-700 text-blue-600 shadow-sm' : 'text-slate-500 dark:text-slate-400'}`}>Single</button>
+              <button onClick={() => setMode('compare')} className={`px-3 py-1.5 rounded-md text-sm font-medium transition ${mode === 'compare' ? 'bg-white dark:bg-slate-700 text-blue-600 shadow-sm' : 'text-slate-500 dark:text-slate-400'}`}>Compare</button>
             </div>
+            {mode === 'single' && (
+              <div className="flex bg-slate-100 dark:bg-slate-800 rounded-lg p-1">
+                <button onClick={() => setAlgorithm('dijkstra')} className={`px-3 py-1.5 rounded-md text-sm font-medium transition ${algorithm === 'dijkstra' ? 'bg-white dark:bg-slate-700 text-blue-600 shadow-sm' : 'text-slate-500 dark:text-slate-400'}`}>Dijkstra</button>
+                <button onClick={() => setAlgorithm('astar')} className={`px-3 py-1.5 rounded-md text-sm font-medium transition ${algorithm === 'astar' ? 'bg-white dark:bg-slate-700 text-blue-600 shadow-sm' : 'text-slate-500 dark:text-slate-400'}`}>A* Search</button>
+              </div>
+            )}
           </div>
           <div className="flex items-center gap-4 flex-wrap">
-            <div className="flex items-center gap-2">
-              <Clock size={16} className="text-slate-400" />
-              <span className="text-xs text-slate-500 dark:text-slate-400 w-16">Speed</span>
-              <input type="range" min="10" max="500" step="10" value={speed} onChange={(e) => setSpeed(Number(e.target.value))} className="w-24 accent-blue-600" />
-              <span className="text-xs text-slate-600 dark:text-slate-300 w-12">{speed}ms</span>
-            </div>
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input type="checkbox" checked={showAlternate} onChange={(e) => setShowAlternate(e.target.checked)} className="rounded border-slate-300 text-blue-600 focus:ring-blue-500" />
-              <span className="text-sm text-slate-700 dark:text-slate-300">Show Alternate</span>
-            </label>
-            <button onClick={computePath} disabled={vizState.status === 'running'} className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-400 text-white rounded-lg font-medium text-sm transition">
-              <Play size={16} /> {vizState.status === 'running' ? 'Computing...' : 'Compute Optimal Path'}
-            </button>
+            {mode === 'single' ? (
+              <>
+                <div className="flex items-center gap-2">
+                  <Clock size={16} className="text-slate-400" />
+                  <span className="text-xs text-slate-500 dark:text-slate-400 w-16">Speed</span>
+                  <input type="range" min="10" max="500" step="10" value={speed} onChange={(e) => setSpeed(Number(e.target.value))} className="w-24 accent-blue-600" />
+                  <span className="text-xs text-slate-600 dark:text-slate-300 w-12">{speed}ms</span>
+                </div>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" checked={showAlternate} onChange={(e) => setShowAlternate(e.target.checked)} className="rounded border-slate-300 text-blue-600 focus:ring-blue-500" />
+                  <span className="text-sm text-slate-700 dark:text-slate-300">Show Alternate</span>
+                </label>
+                <button onClick={computePath} disabled={vizState.status === 'running'} className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-400 text-white rounded-lg font-medium text-sm transition">
+                  <Play size={16} /> {vizState.status === 'running' ? 'Computing...' : 'Compute Optimal Path'}
+                </button>
+              </>
+            ) : (
+              <>
+                <div className="flex items-center gap-2">
+                  <Clock size={16} className="text-slate-400" />
+                  <span className="text-xs text-slate-500 dark:text-slate-400">Dijkstra</span>
+                  <input type="range" min="10" max="500" step="10" value={compareSpeedLeft} onChange={(e) => setLeftSpeed(Number(e.target.value))} className="w-16 accent-amber-500" />
+                  <span className="text-xs text-slate-500 dark:text-slate-400">A*</span>
+                  <input type="range" min="10" max="500" step="10" value={compareSpeedRight} onChange={(e) => setRightSpeed(Number(e.target.value))} className="w-16 accent-violet-500" />
+                </div>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" checked={syncCompareSpeed} onChange={(e) => { setSyncCompareSpeed(e.target.checked); if (e.target.checked) setCompareSpeedRight(compareSpeedLeft); }} className="rounded border-slate-300 text-blue-600 focus:ring-blue-500" />
+                  <span className="text-sm text-slate-700 dark:text-slate-300">Sync Speed</span>
+                </label>
+                <button
+                  onClick={() => { if (!warehouse || !destination) { alert('Please set both Warehouse (Start) and Destination.'); return; } setCompareStats({ dijkstra: null, astar: null }); setComputeSignal(s => s + 1); }}
+                  className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-400 text-white rounded-lg font-medium text-sm transition"
+                >
+                  <Play size={16} /> Compute Both
+                </button>
+              </>
+            )}
             <button onClick={resetAll} className="flex items-center gap-2 px-3 py-2 bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 rounded-lg font-medium text-sm transition">
               <RotateCcw size={16} /> Reset
             </button>
@@ -767,6 +1356,7 @@ const VisualizerPage = () => {
       </div>
 
       <div className="flex-1 flex overflow-hidden">
+        {mode === 'single' && (
         <div className="flex-1 relative">
           <MapContainer center={[12.9716, 77.5946]} zoom={13} className="w-full h-full z-0">
             <TileLayer attribution='&copy; <a href="https://osm.org/copyright">OpenStreetMap</a>' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
@@ -785,6 +1375,8 @@ const VisualizerPage = () => {
                 return (edge.from === from && edge.to === to) || (edge.from === to && edge.to === from);
               });
               let color = '#94a3b8'; let weight = 4; let opacity = 0.6;
+              if (edge.tier === 'secondary') { color = '#b4c2d4'; weight = 2.5; opacity = 0.5; }
+              else if (edge.tier === 'tertiary') { color = '#c3cedb'; weight = 2; opacity = 0.45; }
               if (isTraffic) { color = '#ef4444'; weight = 6; opacity = 0.9; }
               else if (inPrimary) { color = '#06b6d4'; weight = 7; opacity = 1; }
               else if (inAlternate) { color = '#64748b'; weight = 5; opacity = 0.8; }
@@ -795,18 +1387,19 @@ const VisualizerPage = () => {
                 </Polyline>
               );
             })}
-            {Object.values(BANGALORE_GRAPH.nodes).map(node => {
+            {Object.values(BANGALORE_GRAPH.nodes).filter(node => node.tier !== 'junction').map(node => {
               const isFrontier = vizState.frontier.includes(node.id);
               const isVisited = vizState.visited.includes(node.id);
-              let fillColor = '#ffffff'; let color = '#64748b'; let radius = 6;
-              if (node.id === warehouse) { fillColor = '#16a34a'; color = '#14532d'; radius = 10; }
-              else if (stops.includes(node.id)) { fillColor = '#2563eb'; color = '#1e3a8a'; radius = 9; }
-              else if (node.id === destination) { fillColor = '#dc2626'; color = '#7f1d1d'; radius = 10; }
-              else if (isFrontier) { fillColor = '#fbbf24'; color = '#b45309'; radius = 8; }
-              else if (isVisited) { fillColor = '#60a5fa'; color = '#1e40af'; radius = 7; }
+              const isMinor = node.tier === 'secondary' || node.tier === 'tertiary';
+              let fillColor = isMinor ? '#cbd5e1' : '#ffffff'; let color = '#64748b'; let radius = isMinor ? 3 : 6; let fillOpacity = isMinor ? 0.6 : 0.9;
+              if (node.id === warehouse) { fillColor = '#16a34a'; color = '#14532d'; radius = 10; fillOpacity = 0.9; }
+              else if (stops.includes(node.id)) { fillColor = '#2563eb'; color = '#1e3a8a'; radius = 9; fillOpacity = 0.9; }
+              else if (node.id === destination) { fillColor = '#dc2626'; color = '#7f1d1d'; radius = 10; fillOpacity = 0.9; }
+              else if (isFrontier) { fillColor = '#fbbf24'; color = '#b45309'; radius = 8; fillOpacity = 0.9; }
+              else if (isVisited) { fillColor = '#60a5fa'; color = '#1e40af'; radius = 7; fillOpacity = 0.9; }
               return (
-                <CircleMarker key={node.id} center={[node.lat, node.lng]} radius={radius} pathOptions={{ fillColor, color, weight: 2, fillOpacity: 0.9 }}>
-                  <Popup><div className="font-semibold text-sm">{node.name}</div><div className="text-xs text-slate-500">ID: {node.id}</div></Popup>
+                <CircleMarker key={node.id} center={[node.lat, node.lng]} radius={radius} pathOptions={{ fillColor, color, weight: isMinor ? 1 : 2, fillOpacity }}>
+                  <Popup><div className="font-semibold text-sm">{node.name}</div><div className="text-xs text-slate-500">ID: {node.id}{node.tier ? ` \u00b7 ${node.tier}` : ''}</div></Popup>
                 </CircleMarker>
               );
             })}
@@ -845,6 +1438,42 @@ const VisualizerPage = () => {
             <div className="flex items-center gap-2"><span className="w-6 h-1 border-t-2 border-dashed border-slate-500" /> Alternate</div>
           </div>
         </div>
+        )}
+
+        {mode === 'compare' && (
+        <div className="flex-1 relative flex">
+          <div className="absolute top-4 left-4 z-[1000] bg-white/95 dark:bg-slate-900/95 backdrop-blur rounded-xl shadow-xl border border-slate-200 dark:border-slate-700 p-2 flex flex-col gap-2">
+            <div className="text-xs font-bold text-slate-400 uppercase px-2 py-1">Tools</div>
+            <button onClick={() => setActiveTool(activeTool === 'warehouse' ? null : 'warehouse')} className={`p-3 rounded-lg transition flex flex-col items-center gap-1 ${activeTool === 'warehouse' ? 'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300 ring-2 ring-green-500' : 'hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300'}`} title="Set Warehouse (Start)">
+              <Warehouse size={20} /><span className="text-[10px] font-medium">Start</span>
+            </button>
+            <button onClick={() => setActiveTool(activeTool === 'stop' ? null : 'stop')} className={`p-3 rounded-lg transition flex flex-col items-center gap-1 ${activeTool === 'stop' ? 'bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 ring-2 ring-blue-500' : 'hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300'}`} title="Add Delivery Stop (Optional)">
+              <MapPin size={20} /><span className="text-[10px] font-medium">Stop</span>
+            </button>
+            <button onClick={() => setActiveTool(activeTool === 'destination' ? null : 'destination')} className={`p-3 rounded-lg transition flex flex-col items-center gap-1 ${activeTool === 'destination' ? 'bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 ring-2 ring-red-500' : 'hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300'}`} title="Set Destination">
+              <Flag size={20} /><span className="text-[10px] font-medium">End</span>
+            </button>
+            <div className="h-px bg-slate-200 dark:bg-slate-700 my-1" />
+            <button onClick={() => setActiveTool(activeTool === 'traffic' ? null : 'traffic')} className={`p-3 rounded-lg transition flex flex-col items-center gap-1 ${activeTool === 'traffic' ? 'bg-orange-100 dark:bg-orange-900/40 text-orange-700 dark:text-orange-300 ring-2 ring-orange-500' : 'hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300'}`} title="Apply Heavy Traffic (applies to both algorithms)">
+              <AlertTriangle size={20} /><span className="text-[10px] font-medium">Traffic</span>
+            </button>
+          </div>
+          <ComparePanel
+            algorithm="dijkstra" warehouse={warehouse} stops={stops} destination={destination} trafficEdges={trafficEdges}
+            activeTool={activeTool} setActiveTool={setActiveTool}
+            onSetWarehouse={setWarehouse} onAddStop={addStop} onSetDestination={setDestination} onToggleTraffic={toggleTraffic}
+            speed={compareSpeedLeft} computeSignal={computeSignal}
+            onStats={(s) => setCompareStats(prev => ({ ...prev, dijkstra: s }))}
+          />
+          <ComparePanel
+            algorithm="astar" warehouse={warehouse} stops={stops} destination={destination} trafficEdges={trafficEdges}
+            activeTool={activeTool} setActiveTool={setActiveTool}
+            onSetWarehouse={setWarehouse} onAddStop={addStop} onSetDestination={setDestination} onToggleTraffic={toggleTraffic}
+            speed={compareSpeedRight} computeSignal={computeSignal}
+            onStats={(s) => setCompareStats(prev => ({ ...prev, astar: s }))}
+          />
+        </div>
+        )}
 
         <div className="w-80 bg-white dark:bg-slate-900 border-l border-slate-200 dark:border-slate-700 overflow-y-auto">
           <div className="p-6 space-y-6">
@@ -858,13 +1487,15 @@ const VisualizerPage = () => {
               </div>
             </div>
 
+            {mode === 'single' && (
             <div className="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-4 border border-blue-100 dark:border-blue-800">
               <h4 className="font-bold text-blue-900 dark:text-blue-300 mb-2 text-sm">Active Algorithm</h4>
               <p className="text-blue-800 dark:text-blue-200 text-sm font-medium mb-1">{algorithm === 'dijkstra' ? "Dijkstra's Algorithm" : "A* Search"}</p>
               <p className="text-blue-700/80 dark:text-blue-300/80 text-xs leading-relaxed">{algorithm === 'dijkstra' ? "Uniform cost expansion. Explores all directions equally from source." : "Heuristic-guided. Uses Haversine distance to destination as h(n) to prioritize goal-ward nodes."}</p>
             </div>
+            )}
 
-            {analytics && (
+            {mode === 'single' && analytics && (
               <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
                 <h3 className="font-bold text-slate-900 dark:text-white flex items-center gap-2"><BarChart3 size={18} className="text-purple-600" /> Analytics</h3>
                 <div className="grid grid-cols-2 gap-3">
@@ -906,10 +1537,48 @@ const VisualizerPage = () => {
               </div>
             )}
 
-            {!analytics && vizState.status === 'idle' && (
+            {mode === 'single' && !analytics && vizState.status === 'idle' && (
               <div className="text-center py-8 text-slate-400 dark:text-slate-500 text-sm">
                 <Info size={32} className="mx-auto mb-2 opacity-50" />
                 <p>Set Warehouse and Destination. Stops are optional. Then click &quot;Compute Optimal Path&quot;.</p>
+              </div>
+            )}
+
+            {mode === 'compare' && (
+              <div className="space-y-4">
+                <h3 className="font-bold text-slate-900 dark:text-white flex items-center gap-2"><BarChart3 size={18} className="text-purple-600" /> Live Comparison</h3>
+                <div className="grid grid-cols-2 gap-3 text-xs">
+                  <div /><div />
+                  <div className="text-center font-bold text-amber-600">Dijkstra</div>
+                  <div className="text-center font-bold text-violet-600">A* Search</div>
+                </div>
+                {[
+                  { label: 'Status', key: null, render: (s) => s ? (s.status === 'running' ? 'Running…' : 'Done') : 'Idle' },
+                  { label: 'Distance (km)', key: 'distance' },
+                  { label: 'Nodes Explored', key: 'nodesExplored' },
+                  { label: 'Exec. Time (ms)', key: 'execTime' },
+                ].map((row) => (
+                  <div key={row.label} className="grid grid-cols-2 gap-3 text-sm items-center bg-slate-50 dark:bg-slate-800 rounded-lg px-3 py-2">
+                    <div className="col-span-2 text-[11px] uppercase tracking-wide text-slate-400 -mb-1">{row.label}</div>
+                    <div className="text-center font-semibold text-slate-800 dark:text-white">
+                      {row.render ? row.render(compareStats.dijkstra) : (compareStats.dijkstra && compareStats.dijkstra[row.key] != null ? compareStats.dijkstra[row.key] : '—')}
+                    </div>
+                    <div className="text-center font-semibold text-slate-800 dark:text-white">
+                      {row.render ? row.render(compareStats.astar) : (compareStats.astar && compareStats.astar[row.key] != null ? compareStats.astar[row.key] : '—')}
+                    </div>
+                  </div>
+                ))}
+                {compareStats.dijkstra?.status === 'done' && compareStats.astar?.status === 'done' && (
+                  <div className="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-4 border border-blue-100 dark:border-blue-800 text-xs text-blue-800 dark:text-blue-200 leading-relaxed">
+                    Both algorithms find routes of the same total distance (shortest path is unique up to tie-breaking), but A* reaches it after exploring far fewer nodes, it uses the Haversine distance to the destination as a heuristic to search preferentially in the right direction, while Dijkstra expands uniformly outward in all directions.
+                  </div>
+                )}
+                {!warehouse && !destination && (
+                  <div className="text-center py-4 text-slate-400 dark:text-slate-500 text-sm">
+                    <Info size={28} className="mx-auto mb-2 opacity-50" />
+                    <p>Set Warehouse and Destination, then click &quot;Compute Both&quot; to race Dijkstra against A*.</p>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -923,15 +1592,232 @@ const VisualizerPage = () => {
 /* ============================================================
    ROOT APP COMPONENT
    ============================================================ */
+/* ============================================================
+   PAGE — ALGORITHM VISUALIZATION LAB
+   An abstract grid graph (independent of the Bengaluru data) that
+   runs the same runDijkstra/runAStar engine used by the live map,
+   so visitors can watch the search itself without needing to know
+   the city. Nodes get synthetic lat/lng so the existing Haversine
+   heuristic works unchanged.
+   ============================================================ */
+const DEMO_GRAPH = (() => {
+  const cols = 8, rows = 5;
+  const nodes = {};
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const id = `r${r}c${c}`;
+      const x = 40 + c * 82, y = 30 + r * 80;
+      nodes[id] = { id, x, y, lat: y / 3000, lng: x / 3000 };
+    }
+  }
+  const edges = [];
+  let ec = 0;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const id = `r${r}c${c}`;
+      if (c < cols - 1) {
+        const rightId = `r${r}c${c + 1}`;
+        edges.push({ id: `de${ec++}`, roadName: `Edge ${id}-${rightId}`, from: id, to: rightId, distance: haversine(nodes[id].lat, nodes[id].lng, nodes[rightId].lat, nodes[rightId].lng), path: [[nodes[id].lat, nodes[id].lng], [nodes[rightId].lat, nodes[rightId].lng]] });
+      }
+      if (r < rows - 1) {
+        const downId = `r${r + 1}c${c}`;
+        edges.push({ id: `de${ec++}`, roadName: `Edge ${id}-${downId}`, from: id, to: downId, distance: haversine(nodes[id].lat, nodes[id].lng, nodes[downId].lat, nodes[downId].lng), path: [[nodes[id].lat, nodes[id].lng], [nodes[downId].lat, nodes[downId].lng]] });
+      }
+    }
+  }
+  // start and goal sit on the same middle row — nodes above/below are
+  // "closer to start" than the goal is, so Dijkstra must still visit them,
+  // while A*'s heuristic correctly ignores anything that isn't goal-ward.
+  return { nodes, edges, START: 'r2c0', GOAL: 'r2c7' };
+})();
+
+const DemoGraphSVG = ({ viz, palette, showLabels }) => {
+  const { nodes, edges } = DEMO_GRAPH;
+  const inPath = (a, b) => viz.primaryPath.some((p, i) => i < viz.primaryPath.length - 1 && ((p.node === a && viz.primaryPath[i + 1].node === b) || (p.node === b && viz.primaryPath[i + 1].node === a)));
+  return (
+    <svg viewBox="0 0 660 400" className="w-full h-auto">
+      {edges.map(e => {
+        const a = nodes[e.from], b = nodes[e.to];
+        const active = inPath(e.from, e.to);
+        return <line key={e.id} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={active ? palette.path : '#334155'} strokeWidth={active ? 4 : 1.5} opacity={active ? 1 : 0.4} />;
+      })}
+      {Object.values(nodes).map(n => {
+        const isFrontier = viz.frontier.includes(n.id);
+        const isVisited = viz.visited.includes(n.id);
+        const isStart = n.id === DEMO_GRAPH.START;
+        const isGoal = n.id === DEMO_GRAPH.GOAL;
+        let fill = '#1e293b', r = 7;
+        if (isStart) { fill = '#22c55e'; r = 10; }
+        else if (isGoal) { fill = '#ef4444'; r = 10; }
+        else if (isFrontier) { fill = palette.frontier; r = 9; }
+        else if (isVisited) { fill = palette.visited; r = 8; }
+        return (
+          <g key={n.id}>
+            <circle cx={n.x} cy={n.y} r={r} fill={fill} stroke="#0f172a" strokeWidth="1.5" />
+            {showLabels && (isStart || isGoal) && <text x={n.x} y={n.y - 16} textAnchor="middle" className="font-data" fontSize="11" fill="#94a3b8">{isStart ? 'START' : 'GOAL'}</text>}
+          </g>
+        );
+      })}
+    </svg>
+  );
+};
+
+const AlgorithmVisualizationPage = () => {
+  const emptyViz = { status: 'idle', frontier: [], visited: [], primaryPath: [] };
+  const [dijkstraViz, setDijkstraViz] = useState(emptyViz);
+  const [astarViz, setAstarViz] = useState(emptyViz);
+  const [dijkstraResult, setDijkstraResult] = useState(null);
+  const [astarResult, setAstarResult] = useState(null);
+  const [running, setRunning] = useState(false);
+  const latestTokenRef = useRef(0);
+
+  const runOne = async (algorithm, setViz, setResult, token) => {
+    const result = algorithm === 'dijkstra' ? runDijkstra(DEMO_GRAPH, DEMO_GRAPH.START, DEMO_GRAPH.GOAL, new Set()) : runAStar(DEMO_GRAPH, DEMO_GRAPH.START, DEMO_GRAPH.GOAL, new Set());
+    for (let i = 0; i < result.steps.length; i++) {
+      if (latestTokenRef.current !== token) return;
+      const step = result.steps[i];
+      setViz({ status: 'running', frontier: step.frontier || [], visited: step.visited || [], primaryPath: [] });
+      await new Promise(r => setTimeout(r, 90));
+    }
+    if (latestTokenRef.current !== token) return;
+    setViz({ status: 'done', frontier: [], visited: result.steps[result.steps.length - 1]?.visited || [], primaryPath: result.path });
+    setResult({ distance: result.distance.toFixed(3), nodesExplored: result.nodesExplored, totalNodes: Object.keys(DEMO_GRAPH.nodes).length });
+  };
+
+  const runComparison = () => {
+    const token = latestTokenRef.current + 1;
+    latestTokenRef.current = token;
+    setRunning(true);
+    setDijkstraResult(null); setAstarResult(null);
+    setDijkstraViz(emptyViz); setAstarViz(emptyViz);
+    Promise.all([
+      runOne('dijkstra', setDijkstraViz, setDijkstraResult, token),
+      runOne('astar', setAstarViz, setAstarResult, token),
+    ]).then(() => { if (latestTokenRef.current === token) setRunning(false); });
+  };
+
+  useEffect(() => { runComparison(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+
+  const comparisonRows = [
+    { label: 'Paradigm', dijkstra: 'Uniform-cost / greedy', astar: 'Best-first, heuristic-guided' },
+    { label: 'Heuristic', dijkstra: 'None', astar: 'Haversine distance to goal' },
+    { label: 'Optimal path?', dijkstra: 'Always (non-negative weights)', astar: 'Yes, if heuristic is admissible' },
+    { label: 'Exploration shape', dijkstra: 'Expands outward in all directions', astar: 'Stretches toward the goal' },
+    { label: 'Best for', dijkstra: 'Unknown or multiple targets', astar: 'Single known destination' },
+  ];
+
+  return (
+    <div className="min-h-screen bg-white dark:bg-slate-950 transition-colors">
+      <div className="relative overflow-hidden" style={{ background: 'var(--ink)' }}>
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 pt-16 pb-12 text-center fade-up">
+          <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full border border-slate-700 text-[var(--cyan)] font-data text-xs tracking-wide mb-6">
+            <GitGraph size={13} /> ALGORITHM LAB &middot; ABSTRACT GRAPH
+          </div>
+          <h1 className="font-display font-semibold text-4xl md:text-5xl text-white mb-4">Watch the search happen.</h1>
+          <p className="text-slate-400 max-w-2xl mx-auto text-lg">
+            Same start, same goal, same 20-node grid, run through the exact <code className="font-data text-sm bg-slate-800 px-1.5 py-0.5 rounded">runDijkstra</code> / <code className="font-data text-sm bg-slate-800 px-1.5 py-0.5 rounded">runAStar</code> engine that powers the live Bengaluru map.
+          </p>
+        </div>
+      </div>
+
+      {/* DUAL RACE */}
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-14">
+        <div className="flex items-center justify-between mb-6 flex-wrap gap-4">
+          <h2 className="font-display font-semibold text-2xl text-slate-900 dark:text-white">Dijkstra vs A* live</h2>
+          <button onClick={runComparison} disabled={running} className="inline-flex items-center gap-2 px-5 py-2.5 bg-slate-900 dark:bg-white text-white dark:text-slate-900 hover:opacity-90 disabled:opacity-50 rounded-lg font-medium text-sm transition">
+            <Play size={16} /> {running ? 'Running…' : 'Run again'}
+          </button>
+        </div>
+        <div className="grid md:grid-cols-2 gap-6">
+          <div className="rounded-2xl border border-slate-200 dark:border-slate-800 p-5 bg-slate-50 dark:bg-slate-900/40">
+            <div className="flex items-center justify-between mb-3">
+              <span className="font-data text-xs tracking-wide text-[var(--amber)] font-semibold">DIJKSTRA</span>
+              <span className="font-data text-xs text-slate-500">{dijkstraResult ? `${dijkstraResult.nodesExplored}/${dijkstraResult.totalNodes} nodes` : dijkstraViz.status === 'running' ? `${dijkstraViz.visited.length} nodes…` : ''}</span>
+            </div>
+            <DemoGraphSVG viz={dijkstraViz} palette={{ frontier: '#fbbf24', visited: '#92400e', path: '#fbbf24' }} showLabels />
+            {dijkstraResult && <div className="mt-3 font-data text-sm text-slate-600 dark:text-slate-300">distance: {dijkstraResult.distance} &middot; explored {dijkstraResult.nodesExplored} of {dijkstraResult.totalNodes} nodes</div>}
+          </div>
+          <div className="rounded-2xl border border-slate-200 dark:border-slate-800 p-5 bg-slate-50 dark:bg-slate-900/40">
+            <div className="flex items-center justify-between mb-3">
+              <span className="font-data text-xs tracking-wide text-[var(--violet)] font-semibold">A* SEARCH</span>
+              <span className="font-data text-xs text-slate-500">{astarResult ? `${astarResult.nodesExplored}/${astarResult.totalNodes} nodes` : astarViz.status === 'running' ? `${astarViz.visited.length} nodes…` : ''}</span>
+            </div>
+            <DemoGraphSVG viz={astarViz} palette={{ frontier: '#a78bfa', visited: '#5b21b6', path: '#a78bfa' }} showLabels />
+            {astarResult && <div className="mt-3 font-data text-sm text-slate-600 dark:text-slate-300">distance: {astarResult.distance} &middot; explored {astarResult.nodesExplored} of {astarResult.totalNodes} nodes</div>}
+          </div>
+        </div>
+        {dijkstraResult && astarResult && (
+          <div className="mt-6 rounded-xl border border-slate-200 dark:border-slate-800 p-5 bg-white dark:bg-slate-900/40 font-body text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+            Both algorithms agree on distance (<span className="font-data">{dijkstraResult.distance}</span>), the shortest path doesn&apos;t change. A* just found it after checking <span className="font-data text-[var(--violet)] font-medium">{astarResult.nodesExplored}</span> nodes instead of Dijkstra&apos;s <span className="font-data text-[var(--amber)] font-medium">{dijkstraResult.nodesExplored}</span>, because its heuristic ruled out nodes that pointed away from the goal.
+          </div>
+        )}
+      </div>
+
+      {/* COMPLEXITY CARDS */}
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 pb-14">
+        <h2 className="font-display font-semibold text-2xl text-slate-900 dark:text-white mb-6">Complexity</h2>
+        <div className="grid md:grid-cols-2 gap-5">
+          {['dijkstra', 'astar'].map(key => {
+            const info = ALGORITHMS_INFO[key];
+            const accent = key === 'dijkstra' ? 'var(--amber)' : 'var(--violet)';
+            return (
+              <div key={key} className="rounded-2xl border border-slate-200 dark:border-slate-800 p-6">
+                <h3 className="font-display font-semibold text-lg text-slate-900 dark:text-white mb-4">{info.name}</h3>
+                <div className="space-y-3 mb-4">
+                  <div>
+                    <div className="text-xs text-slate-400 mb-1">Time</div>
+                    <div className="font-data text-base font-medium" style={{ color: accent }}>{info.timeComplexity}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-slate-400 mb-1">Space</div>
+                    <div className="font-data text-base font-medium" style={{ color: accent }}>{info.spaceComplexity}</div>
+                  </div>
+                </div>
+                <p className="text-sm text-slate-500 dark:text-slate-400 leading-relaxed">{info.description}</p>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* COMPARISON TABLE */}
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 pb-20">
+        <h2 className="font-display font-semibold text-2xl text-slate-900 dark:text-white mb-6">Side by side</h2>
+        <div className="rounded-2xl border border-slate-200 dark:border-slate-800 overflow-hidden">
+          <div className="grid grid-cols-3 bg-slate-50 dark:bg-slate-900/60 text-sm font-semibold text-slate-500 dark:text-slate-400 px-5 py-3">
+            <div />
+            <div className="text-[var(--amber)]">Dijkstra</div>
+            <div className="text-[var(--violet)]">A* Search</div>
+          </div>
+          {comparisonRows.map((row, i) => (
+            <div key={row.label} className={`grid grid-cols-3 px-5 py-4 text-sm ${i % 2 ? 'bg-white dark:bg-slate-950' : 'bg-slate-50/50 dark:bg-slate-900/30'}`}>
+              <div className="text-slate-400 font-medium">{row.label}</div>
+              <div className="text-slate-700 dark:text-slate-300">{row.dijkstra}</div>
+              <div className="text-slate-700 dark:text-slate-300">{row.astar}</div>
+            </div>
+          ))}
+        </div>
+        <div className="mt-8 text-center">
+          <Link to="/project" className="inline-flex items-center gap-2 text-sm font-medium text-slate-600 dark:text-slate-300 hover:text-[var(--cyan-deep)] dark:hover:text-[var(--cyan)] transition">
+            Ready for the real thing? Open the live Bengaluru map <ChevronRight size={16} />
+          </Link>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const App = () => {
   return (
     <ThemeProvider>
+      <GlobalStyle />
       <Router>
-        <div className="min-h-screen bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors">
+        <div className="min-h-screen bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 font-body transition-colors">
           <Navbar />
           <Routes>
             <RouterRoute path="/" element={<HomePage />} />
             <RouterRoute path="/info" element={<InfoPage />} />
+            <RouterRoute path="/visualization" element={<AlgorithmVisualizationPage />} />
             <RouterRoute path="/project" element={<VisualizerPage />} />
           </Routes>
         </div>
