@@ -1696,7 +1696,8 @@ const AlgorithmVisualizationPage = () => {
     ]).then(() => { if (latestTokenRef.current === token) setRunning(false); });
   };
 
-  useEffect(() => { runComparison(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { runComparison(); }, []);
 
   const comparisonRows = [
     { label: 'Paradigm', dijkstra: 'Uniform-cost / greedy', astar: 'Best-first, heuristic-guided' },
